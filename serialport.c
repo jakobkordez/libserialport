@@ -2741,12 +2741,22 @@ SP_API void sp_set_debug_handler(void (*handler)(const char *format, ...))
 
 SP_API void sp_default_debug_handler(const char *format, ...)
 {
+	/* -1 until the environment has been looked at. */
+	static int enabled = -1;
 	va_list args;
+
+	/*
+	 * This runs several times in every API call, and getenv() is slow
+	 * enough (microseconds on Windows) to dominate one. Ask only once.
+	 */
+	if (enabled < 0)
+		enabled = getenv("LIBSERIALPORT_DEBUG") != NULL;
+	if (!enabled)
+		return;
+
 	va_start(args, format);
-	if (getenv("LIBSERIALPORT_DEBUG")) {
-		fputs("sp: ", stderr);
-		vfprintf(stderr, format, args);
-	}
+	fputs("sp: ", stderr);
+	vfprintf(stderr, format, args);
 	va_end(args);
 }
 

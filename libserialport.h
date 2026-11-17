@@ -1674,6 +1674,9 @@ SP_API void sp_set_debug_handler(void (*handler)(const char *format, ...));
  * environment variable LIBSERIALPORT_DEBUG is set. Otherwise, they are
  * ignored.
  *
+ * The variable is read once, when the first message is produced. Setting or
+ * clearing it after that has no effect.
+ *
  * @param[in] format The format string to use. Must not be NULL.
  * @param[in] ... The variable length argument list to use.
  *
