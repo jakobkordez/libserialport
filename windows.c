@@ -390,32 +390,59 @@ static void get_usb_details(struct sp_port *port, DEVINST dev_inst_match)
 	return;
 }
 
-SP_PRIV enum sp_return get_port_details(struct sp_port *port)
-{
-	/*
-	 * Description limited to 127 char, anything longer
-	 * would not be user friendly anyway.
-	 */
-	WCHAR description[128];
-	SP_DEVINFO_DATA device_info_data = { .cbSize = sizeof(device_info_data) };
+/* Size of a port name in the registry, in WCHARs including the NUL. */
+#define MAX_PORT_NAME 8
+
+/* A present device that has a serial port name. */
+struct port_device {
+	/* Port name, as UTF-8. */
+	char name[MAX_PORT_NAME * 3];
+	DEVINST dev_inst;
+};
+
+/* The serial port devices found by one walk over the present devices. */
+struct port_index {
 	HDEVINFO device_info;
+	struct port_device *devices;
+	size_t count;
+};
+
+static void free_port_index(struct port_index *index)
+{
+	free(index->devices);
+	SetupDiDestroyDeviceInfoList(index->device_info);
+}
+
+/*
+ * Walk the present devices, collecting those that have a serial port name.
+ *
+ * The walk is the expensive part of looking up a port's details, so
+ * list_ports() does it once and shares the result between all its ports.
+ * If only_name is given, the walk stops at the first device of that name.
+ */
+static enum sp_return build_port_index(struct port_index *index,
+                                       const char *only_name)
+{
+	SP_DEVINFO_DATA device_info_data = { .cbSize = sizeof(device_info_data) };
+	size_t capacity = 0;
 	int i;
 
-	device_info = SetupDiGetClassDevs(NULL, 0, 0,
-	                                  DIGCF_PRESENT | DIGCF_ALLCLASSES);
-	if (device_info == INVALID_HANDLE_VALUE)
+	index->devices = NULL;
+	index->count = 0;
+	index->device_info = SetupDiGetClassDevs(NULL, 0, 0,
+	                                         DIGCF_PRESENT | DIGCF_ALLCLASSES);
+	if (index->device_info == INVALID_HANDLE_VALUE)
 		RETURN_FAIL("SetupDiGetClassDevs() failed");
 
-	for (i = 0; SetupDiEnumDeviceInfo(device_info, i, &device_info_data); i++) {
+	for (i = 0; SetupDiEnumDeviceInfo(index->device_info, i, &device_info_data); i++) {
+		struct port_device *device;
 		HKEY device_key;
-		DEVINST dev_inst;
-		WCHAR value[8];
-		char value_utf8[ARRAYSIZE(value) * 3], class[16];
+		WCHAR value[MAX_PORT_NAME];
+		char value_utf8[ARRAYSIZE(value) * 3];
 		DWORD size, type;
-		CONFIGRET cr;
 
-		/* Check if this is the device we are looking for. */
-		device_key = SetupDiOpenDevRegKey(device_info, &device_info_data,
+		/* Check if this device has a port name. */
+		device_key = SetupDiOpenDevRegKey(index->device_info, &device_info_data,
 		                                  DICS_FLAG_GLOBAL, 0,
 		                                  DIREG_DEV, KEY_QUERY_VALUE);
 		if (device_key == INVALID_HANDLE_VALUE)
@@ -432,103 +459,154 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 		value[size < ARRAYSIZE(value) ? size : ARRAYSIZE(value) - 1] = 0;
 		if (!WideCharToMultiByte(CP_UTF8, 0, value, -1, value_utf8,
 		                         sizeof(value_utf8), NULL, NULL)
-		    || strcmp(value_utf8, port->name))
+		    || (only_name && strcmp(value_utf8, only_name)))
 			continue;
 
-		/* Check port transport type. */
-		dev_inst = device_info_data.DevInst;
-		size = sizeof(class);
-		cr = CR_FAILURE;
-		while (CM_Get_Parent(&dev_inst, dev_inst, 0) == CR_SUCCESS &&
-		       (cr = CM_Get_DevNode_Registry_PropertyA(dev_inst,
-		                 CM_DRP_CLASS, 0, class, &size, 0)) != CR_SUCCESS) { }
-		if (cr == CR_SUCCESS) {
-			if (!strcmp(class, "USB"))
-				port->transport = SP_TRANSPORT_USB;
-		}
-
-		/* Get port description (friendly name). */
-		dev_inst = device_info_data.DevInst;
-		while ((size = sizeof(description),
-		        cr = CM_Get_DevNode_Registry_PropertyW(dev_inst,
-		          CM_DRP_FRIENDLYNAME, 0, description, &size, 0)) != CR_SUCCESS
-		       && CM_Get_Parent(&dev_inst, dev_inst, 0) == CR_SUCCESS) { }
-		if (cr == CR_SUCCESS)
-			port->description = wc_to_utf8(description, size);
-
-		/* Get more informations for USB connected ports. */
-		if (port->transport == SP_TRANSPORT_USB) {
-			char usb_path[MAX_USB_PATH] = "", tmp[MAX_USB_PATH];
-			char device_id[MAX_DEVICE_ID_LEN];
-
-			/* Recurse over parents to build the USB device path. */
-			dev_inst = device_info_data.DevInst;
-			do {
-				/* Verify that this layer of the tree is USB related. */
-				if (CM_Get_Device_IDA(dev_inst, device_id,
-				                      sizeof(device_id), 0) != CR_SUCCESS
-				    || strncmp(device_id, "USB\\", 4))
-					continue;
-
-				/* Discard one layer for composite devices. */
-				char compat_ids[512], *p = compat_ids;
-				size = sizeof(compat_ids);
-				if (CM_Get_DevNode_Registry_PropertyA(dev_inst,
-				                                      CM_DRP_COMPATIBLEIDS, 0,
-				                                      &compat_ids,
-				                                      &size, 0) == CR_SUCCESS) {
-					while (*p) {
-						if (!strncmp(p, "USB\\COMPOSITE", 13))
-							break;
-						p += strlen(p) + 1;
-					}
-					if (*p)
-						continue;
-				}
-
-				/* Stop the recursion when reaching the USB root. */
-				if (!strncmp(device_id, "USB\\ROOT", 8))
-					break;
-
-				/* Prepend the address of current USB layer to the USB path. */
-				DWORD address;
-				size = sizeof(address);
-				if (CM_Get_DevNode_Registry_PropertyA(dev_inst, CM_DRP_ADDRESS,
-				                        0, &address, &size, 0) == CR_SUCCESS) {
-					strcpy(tmp, usb_path);
-					snprintf(usb_path, sizeof(usb_path), "%d%s%s",
-					         (int)address, *tmp ? "." : "", tmp);
-				}
-			} while (CM_Get_Parent(&dev_inst, dev_inst, 0) == CR_SUCCESS);
-
-			port->usb_path = strdup(usb_path);
-
-			/* Wake up the USB device to be able to read string descriptor. */
-			char *escaped_port_name;
-			WCHAR *escaped_port_name_wc;
-			HANDLE handle;
-			if (!(escaped_port_name = malloc(strlen(port->name) + 5)))
-				RETURN_ERROR(SP_ERR_MEM, "Escaped port name malloc failed");
-			sprintf(escaped_port_name, "\\\\.\\%s", port->name);
-			escaped_port_name_wc = utf8_to_wc(escaped_port_name);
-			free(escaped_port_name);
-			if (escaped_port_name_wc) {
-				handle = CreateFileW(escaped_port_name_wc, GENERIC_READ, 0, 0,
-				                     OPEN_EXISTING,
-				                     FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OVERLAPPED, 0);
-				free(escaped_port_name_wc);
-				CloseHandle(handle);
+		if (index->count == capacity) {
+			capacity = capacity ? capacity * 2 : 16;
+			device = realloc(index->devices, capacity * sizeof(*device));
+			if (!device) {
+				free_port_index(index);
+				RETURN_ERROR(SP_ERR_MEM, "Port index realloc failed");
 			}
-
-			/* Retrieve USB device details from the device descriptor. */
-			get_usb_details(port, device_info_data.DevInst);
+			index->devices = device;
 		}
-		break;
+		device = &index->devices[index->count++];
+		strcpy(device->name, value_utf8);
+		device->dev_inst = device_info_data.DevInst;
+
+		if (only_name)
+			break;
 	}
 
-	SetupDiDestroyDeviceInfoList(device_info);
+	RETURN_OK();
+}
+
+/* Fill in the details of a port from the device of its name in the index. */
+static enum sp_return get_indexed_port_details(struct sp_port *port, void *context)
+{
+	const struct port_index *index = context;
+	/*
+	 * Description limited to 127 char, anything longer
+	 * would not be user friendly anyway.
+	 */
+	WCHAR description[128];
+	DEVINST dev_inst, port_dev_inst;
+	char class[16];
+	DWORD size;
+	CONFIGRET cr;
+	size_t i;
+
+	/* As the walk did before, take the first device of this name. */
+	for (i = 0; i < index->count; i++)
+		if (!strcmp(index->devices[i].name, port->name))
+			break;
+	if (i == index->count)
+		RETURN_OK();
+	port_dev_inst = index->devices[i].dev_inst;
+
+	/* Check port transport type. */
+	dev_inst = port_dev_inst;
+	size = sizeof(class);
+	cr = CR_FAILURE;
+	while (CM_Get_Parent(&dev_inst, dev_inst, 0) == CR_SUCCESS &&
+	       (cr = CM_Get_DevNode_Registry_PropertyA(dev_inst,
+	                 CM_DRP_CLASS, 0, class, &size, 0)) != CR_SUCCESS) { }
+	if (cr == CR_SUCCESS) {
+		if (!strcmp(class, "USB"))
+			port->transport = SP_TRANSPORT_USB;
+	}
+
+	/* Get port description (friendly name). */
+	dev_inst = port_dev_inst;
+	while ((size = sizeof(description),
+	        cr = CM_Get_DevNode_Registry_PropertyW(dev_inst,
+	          CM_DRP_FRIENDLYNAME, 0, description, &size, 0)) != CR_SUCCESS
+	       && CM_Get_Parent(&dev_inst, dev_inst, 0) == CR_SUCCESS) { }
+	if (cr == CR_SUCCESS)
+		port->description = wc_to_utf8(description, size);
+
+	/* Get more informations for USB connected ports. */
+	if (port->transport == SP_TRANSPORT_USB) {
+		char usb_path[MAX_USB_PATH] = "", tmp[MAX_USB_PATH];
+		char device_id[MAX_DEVICE_ID_LEN];
+
+		/* Recurse over parents to build the USB device path. */
+		dev_inst = port_dev_inst;
+		do {
+			/* Verify that this layer of the tree is USB related. */
+			if (CM_Get_Device_IDA(dev_inst, device_id,
+			                      sizeof(device_id), 0) != CR_SUCCESS
+			    || strncmp(device_id, "USB\\", 4))
+				continue;
+
+			/* Discard one layer for composite devices. */
+			char compat_ids[512], *p = compat_ids;
+			size = sizeof(compat_ids);
+			if (CM_Get_DevNode_Registry_PropertyA(dev_inst,
+			                                      CM_DRP_COMPATIBLEIDS, 0,
+			                                      &compat_ids,
+			                                      &size, 0) == CR_SUCCESS) {
+				while (*p) {
+					if (!strncmp(p, "USB\\COMPOSITE", 13))
+						break;
+					p += strlen(p) + 1;
+				}
+				if (*p)
+					continue;
+			}
+
+			/* Stop the recursion when reaching the USB root. */
+			if (!strncmp(device_id, "USB\\ROOT", 8))
+				break;
+
+			/* Prepend the address of current USB layer to the USB path. */
+			DWORD address;
+			size = sizeof(address);
+			if (CM_Get_DevNode_Registry_PropertyA(dev_inst, CM_DRP_ADDRESS,
+			                        0, &address, &size, 0) == CR_SUCCESS) {
+				strcpy(tmp, usb_path);
+				snprintf(usb_path, sizeof(usb_path), "%d%s%s",
+				         (int)address, *tmp ? "." : "", tmp);
+			}
+		} while (CM_Get_Parent(&dev_inst, dev_inst, 0) == CR_SUCCESS);
+
+		port->usb_path = strdup(usb_path);
+
+		/* Wake up the USB device to be able to read string descriptor. */
+		char *escaped_port_name;
+		WCHAR *escaped_port_name_wc;
+		HANDLE handle;
+		if (!(escaped_port_name = malloc(strlen(port->name) + 5)))
+			RETURN_ERROR(SP_ERR_MEM, "Escaped port name malloc failed");
+		sprintf(escaped_port_name, "\\\\.\\%s", port->name);
+		escaped_port_name_wc = utf8_to_wc(escaped_port_name);
+		free(escaped_port_name);
+		if (escaped_port_name_wc) {
+			handle = CreateFileW(escaped_port_name_wc, GENERIC_READ, 0, 0,
+			                     OPEN_EXISTING,
+			                     FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OVERLAPPED, 0);
+			free(escaped_port_name_wc);
+			CloseHandle(handle);
+		}
+
+		/* Retrieve USB device details from the device descriptor. */
+		get_usb_details(port, port_dev_inst);
+	}
 
 	RETURN_OK();
+}
+
+SP_PRIV enum sp_return get_port_details(struct sp_port *port)
+{
+	struct port_index index;
+	enum sp_return ret;
+
+	TRY(build_port_index(&index, port->name));
+	ret = get_indexed_port_details(port, &index);
+	free_port_index(&index);
+
+	return ret;
 }
 
 SP_PRIV enum sp_return list_ports(struct sp_port ***list)
@@ -540,6 +618,7 @@ SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 	DWORD type, index = 0;
 	LSTATUS result;
 	char *name;
+	struct port_index devices;
 	int ret = SP_OK;
 
 	DEBUG("Opening registry key");
@@ -568,6 +647,10 @@ SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 		SET_ERROR(ret, SP_ERR_MEM, "Registry data malloc failed");
 		goto out_free_value;
 	}
+	/* One walk over the devices serves every port in the list. */
+	DEBUG("Indexing serial port devices");
+	if ((ret = build_port_index(&devices, NULL)) != SP_OK)
+		goto out;
 	DEBUG("Iterating over values");
 	while (
 		value_len = max_value_len + 1,
@@ -579,18 +662,21 @@ SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 			/* wc_to_utf8() NUL-terminates; the registry data may not be. */
 			if (!(name = wc_to_utf8(data, data_size))) {
 				SET_ERROR(ret, SP_ERR_MEM, "Registry port name malloc failed");
-				goto out;
+				goto out_free_index;
 			}
 			DEBUG_FMT("Found port %s", name);
-			if (!(*list = list_append(*list, name))) {
+			if (!(*list = list_append_using(*list, name,
+					get_indexed_port_details, &devices))) {
 				SET_ERROR(ret, SP_ERR_MEM, "List append failed");
 				free(name);
-				goto out;
+				goto out_free_index;
 			}
 			free(name);
 		}
 		index++;
 	}
+out_free_index:
+	free_port_index(&devices);
 out:
 	free(data);
 out_free_value:

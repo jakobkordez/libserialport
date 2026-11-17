@@ -53,15 +53,20 @@ static enum sp_return get_config(struct sp_port *port, struct port_data *data,
 static enum sp_return set_config(struct sp_port *port, struct port_data *data,
 	const struct sp_port_config *config);
 
-SP_API enum sp_return sp_get_port_by_name(const char *portname, struct sp_port **port_ptr)
+/**
+ * Create a port structure for a port name.
+ *
+ * Its details are filled in by the given function, or by get_port_details()
+ * if that is NULL.
+ */
+static enum sp_return get_port(const char *portname, port_details_fn details,
+                               void *context, struct sp_port **port_ptr)
 {
 	struct sp_port *port;
 #ifndef NO_PORT_METADATA
 	enum sp_return ret;
 #endif
 	size_t len;
-
-	TRACE("%s, %p", portname, port_ptr);
 
 	if (!port_ptr)
 		RETURN_ERROR(SP_ERR_ARG, "Null result pointer");
@@ -125,15 +130,26 @@ SP_API enum sp_return sp_get_port_by_name(const char *portname, struct sp_port *
 	port->bluetooth_address = NULL;
 
 #ifndef NO_PORT_METADATA
-	if ((ret = get_port_details(port)) != SP_OK) {
+	ret = details ? details(port, context) : get_port_details(port);
+	if (ret != SP_OK) {
 		sp_free_port(port);
 		return ret;
 	}
+#else
+	(void)details;
+	(void)context;
 #endif
 
 	*port_ptr = port;
 
 	RETURN_OK();
+}
+
+SP_API enum sp_return sp_get_port_by_name(const char *portname, struct sp_port **port_ptr)
+{
+	TRACE("%s, %p", portname, port_ptr);
+
+	return get_port(portname, NULL, NULL, port_ptr);
 }
 
 SP_API char *sp_get_port_name(const struct sp_port *port)
@@ -324,6 +340,14 @@ SP_API void sp_free_port(struct sp_port *port)
 SP_PRIV struct sp_port **list_append(struct sp_port **list,
                                      const char *portname)
 {
+	return list_append_using(list, portname, NULL, NULL);
+}
+
+SP_PRIV struct sp_port **list_append_using(struct sp_port **list,
+                                           const char *portname,
+                                           port_details_fn details,
+                                           void *context)
+{
 	void *tmp;
 	size_t count;
 	enum sp_return ret;
@@ -333,7 +357,7 @@ SP_PRIV struct sp_port **list_append(struct sp_port **list,
 	if (!(tmp = realloc(list, sizeof(struct sp_port *) * (count + 2))))
 		goto fail;
 	list = tmp;
-	ret = sp_get_port_by_name(portname, &list[count]);
+	ret = get_port(portname, details, context, &list[count]);
 	if (ret == SP_ERR_MEM)
 		goto fail;
 	if (ret != SP_OK) {

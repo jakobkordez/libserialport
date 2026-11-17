@@ -275,7 +275,17 @@ extern void (*sp_debug_handler)(const char *format, ...);
 
 #define TRY(x) do { int retval = x; if (retval != SP_OK) RETURN_CODEVAL(retval); } while (0)
 
+/*
+ * Fills in the details of a newly created port. A backend that has already
+ * gathered what it needs for a whole enumeration can pass one of these, with
+ * that data as the context, to list_append_using().
+ */
+typedef enum sp_return (*port_details_fn)(struct sp_port *port, void *context);
+
 SP_PRIV struct sp_port **list_append(struct sp_port **list, const char *portname);
+/* As list_append(), but with details looked up by the given function. */
+SP_PRIV struct sp_port **list_append_using(struct sp_port **list,
+		const char *portname, port_details_fn details, void *context);
 
 /* OS-specific Helper functions. */
 SP_PRIV enum sp_return get_port_details(struct sp_port *port);
