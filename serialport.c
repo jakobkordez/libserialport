@@ -1409,8 +1409,11 @@ SP_API enum sp_return sp_nonblocking_read(struct sp_port *port, void *buf,
 		if (GetLastError() != ERROR_IO_PENDING)
 			RETURN_FAIL("ReadFile() failed");
 
-	/* Get number of bytes read. */
-	if (GetOverlappedResult(port->hdl, &port->read_ovl, &bytes_read, FALSE) == 0)
+	/*
+	 * Get number of bytes read. Wait, as a driver may complete the read
+	 * asynchronously and would then write to buf after we return.
+	 */
+	if (GetOverlappedResult(port->hdl, &port->read_ovl, &bytes_read, TRUE) == 0)
 		RETURN_FAIL("GetOverlappedResult() failed");
 
 	TRY(restart_wait_if_needed(port, bytes_read));
