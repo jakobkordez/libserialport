@@ -690,6 +690,17 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 		config.baudrate = 9600;
 	}
 
+#ifndef _WIN32
+	/*
+	 * Likewise settle the parity setting if parity is simply off.
+	 * get_config() only recognizes "no parity" as set_config() writes it,
+	 * with IGNPAR set, which is not how the OS hands a port over. Left
+	 * alone, the setting would read back as invalid until it was set.
+	 */
+	if (config.parity < 0 && !(data.term.c_cflag & PARENB))
+		config.parity = SP_PARITY_NONE;
+#endif
+
 	/* Set sane port settings. */
 #ifdef _WIN32
 	data.dcb.fBinary = TRUE;
