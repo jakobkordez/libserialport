@@ -87,7 +87,12 @@ SP_API enum sp_return sp_get_port_by_name(const char *portname, struct sp_port *
 	portname = pathbuf;
 #endif
 
-	if (!(port = malloc(sizeof(struct sp_port))))
+	/*
+	 * Zero the structure, so that the OS-specific state not set below
+	 * (on Windows: the OVERLAPPED event handles, timeouts and wait
+	 * flags) has a defined value before the port is first opened.
+	 */
+	if (!(port = calloc(1, sizeof(struct sp_port))))
 		RETURN_ERROR(SP_ERR_MEM, "Port structure malloc failed");
 
 	len = strlen(portname) + 1;
@@ -560,12 +565,14 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 		RETURN_FAIL("SetCommTimeouts() failed");
 	}
 
-	/* Prepare OVERLAPPED structures. */
+	/*
+	 * Prepare OVERLAPPED structures. A NULL hEvent means "no event":
+	 * that is what CreateEvent() returns on failure, and what sp_close()
+	 * leaves behind.
+	 */
 #define INIT_OVERLAPPED(ovl) do { \
 	memset(&port->ovl, 0, sizeof(port->ovl)); \
-	port->ovl.hEvent = INVALID_HANDLE_VALUE; \
-	if ((port->ovl.hEvent = CreateEvent(NULL, TRUE, TRUE, NULL)) \
-			== INVALID_HANDLE_VALUE) { \
+	if (!(port->ovl.hEvent = CreateEvent(NULL, TRUE, TRUE, NULL))) { \
 		sp_close(port); \
 		RETURN_FAIL(#ovl "CreateEvent() failed"); \
 	} \
@@ -583,6 +590,7 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 
 	port->writing = FALSE;
 	port->wait_running = FALSE;
+	port->last_wait_thread_exited = FALSE;
 
 	ret = restart_wait(port);
 
@@ -706,8 +714,10 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 #endif
 
 #ifdef _WIN32
-	if (ClearCommError(port->hdl, &errors, &status) == 0)
+	if (ClearCommError(port->hdl, &errors, &status) == 0) {
+		sp_close(port);
 		RETURN_FAIL("ClearCommError() failed");
+	}
 #endif
 
 	ret = set_config(port, &data, &config);
@@ -734,10 +744,16 @@ SP_API enum sp_return sp_close(struct sp_port *port)
 		RETURN_FAIL("Port CloseHandle() failed");
 	port->hdl = INVALID_HANDLE_VALUE;
 
-	/* Close event handles for overlapped structures. */
+	/*
+	 * Close event handles for overlapped structures. Each handle is
+	 * forgotten as it is closed, so that closing a port which was only
+	 * partly opened, or opened and closed before, never touches a handle
+	 * that is no longer ours.
+	 */
 #define CLOSE_OVERLAPPED(ovl) do { \
-	if (port->ovl.hEvent != INVALID_HANDLE_VALUE && \
-		CloseHandle(port->ovl.hEvent) == 0) \
+	HANDLE event = port->ovl.hEvent; \
+	port->ovl.hEvent = NULL; \
+	if (event && CloseHandle(event) == 0) \
 		RETURN_FAIL(# ovl "event CloseHandle() failed"); \
 } while (0)
 	CLOSE_OVERLAPPED(read_ovl);
