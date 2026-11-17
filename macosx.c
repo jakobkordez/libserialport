@@ -54,7 +54,7 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 			continue;
 		}
 		result = CFStringGetCString(cf_property, path, sizeof(path),
-		                            kCFStringEncodingASCII);
+		                            kCFStringEncodingUTF8);
 		CFRelease(cf_property);
 		if (!result || strcmp(path, port->name)) {
 			IOObjectRelease(ioport);
@@ -67,7 +67,7 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 		           CFSTR("IOClass"), kCFAllocatorDefault,
 		           kIORegistryIterateRecursively | kIORegistryIterateParents))) {
 			if (CFStringGetCString(cf_property, class, sizeof(class),
-			                       kCFStringEncodingASCII) &&
+			                       kCFStringEncodingUTF8) &&
 			    strstr(class, "USB")) {
 				DEBUG("Found USB class device");
 				port->transport = SP_TRANSPORT_USB;
@@ -78,7 +78,7 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 		           CFSTR("IOProviderClass"), kCFAllocatorDefault,
 		           kIORegistryIterateRecursively | kIORegistryIterateParents))) {
 			if (CFStringGetCString(cf_property, class, sizeof(class),
-			                       kCFStringEncodingASCII) &&
+			                       kCFStringEncodingUTF8) &&
 			    strstr(class, "USB")) {
 				DEBUG("Found USB class device");
 				port->transport = SP_TRANSPORT_USB;
@@ -99,7 +99,7 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 		    (cf_property = IORegistryEntryCreateCFProperty(ioport,
 		         CFSTR(kIOTTYDeviceKey), kCFAllocatorDefault, 0))) {
 			if (CFStringGetCString(cf_property, description, sizeof(description),
-			                       kCFStringEncodingASCII)) {
+			                       kCFStringEncodingUTF8)) {
 				DEBUG_FMT("Found description %s", description);
 				port->description = strdup(description);
 			}
@@ -156,7 +156,7 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 		         CFSTR("USB Vendor Name"), kCFAllocatorDefault,
 		         kIORegistryIterateRecursively | kIORegistryIterateParents))) {
 			if (CFStringGetCString(cf_property, manufacturer, sizeof(manufacturer),
-			                       kCFStringEncodingASCII)) {
+			                       kCFStringEncodingUTF8)) {
 				DEBUG_FMT("Found manufacturer %s", manufacturer);
 				port->usb_manufacturer = strdup(manufacturer);
 			}
@@ -167,7 +167,7 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 		         CFSTR("USB Product Name"), kCFAllocatorDefault,
 		         kIORegistryIterateRecursively | kIORegistryIterateParents))) {
 			if (CFStringGetCString(cf_property, product, sizeof(product),
-			                       kCFStringEncodingASCII)) {
+			                       kCFStringEncodingUTF8)) {
 				DEBUG_FMT("Found product name %s", product);
 				port->usb_product = strdup(product);
 			}
@@ -178,7 +178,7 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 		         CFSTR("USB Serial Number"), kCFAllocatorDefault,
 		         kIORegistryIterateRecursively | kIORegistryIterateParents))) {
 			if (CFStringGetCString(cf_property, serial, sizeof(serial),
-			                       kCFStringEncodingASCII)) {
+			                       kCFStringEncodingUTF8)) {
 				DEBUG_FMT("Found serial number %s", serial);
 				port->usb_serial = strdup(serial);
 			}
@@ -222,7 +222,7 @@ SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 				CFSTR(kIOCalloutDeviceKey), kCFAllocatorDefault, 0);
 		if (cf_path) {
 			result = CFStringGetCString(cf_path, path, sizeof(path),
-			                            kCFStringEncodingASCII);
+			                            kCFStringEncodingUTF8);
 			CFRelease(cf_path);
 			if (result) {
 				DEBUG_FMT("Found port %s", path);
