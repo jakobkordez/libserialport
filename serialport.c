@@ -490,12 +490,19 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 #ifdef _WIN32
 	DWORD desired_access = 0, flags_and_attributes = 0, errors;
 	char *escaped_port_name;
+	WCHAR *escaped_port_name_wc;
 	COMSTAT status;
 
 	/* Prefix port name with '\\.\' to work with ports above COM9. */
 	if (!(escaped_port_name = malloc(strlen(port->name) + 5)))
 		RETURN_ERROR(SP_ERR_MEM, "Escaped port name malloc failed");
 	sprintf(escaped_port_name, "\\\\.\\%s", port->name);
+
+	/* Port names are UTF-8; open through the wide API. */
+	escaped_port_name_wc = utf8_to_wc(escaped_port_name);
+	free(escaped_port_name);
+	if (!escaped_port_name_wc)
+		RETURN_FAIL("Port name conversion failed");
 
 	/* Map 'flags' to the OS-specific settings. */
 	flags_and_attributes = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
@@ -504,10 +511,10 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 	if (flags & SP_MODE_WRITE)
 		desired_access |= GENERIC_WRITE;
 
-	port->hdl = CreateFileA(escaped_port_name, desired_access, 0, 0,
+	port->hdl = CreateFileW(escaped_port_name_wc, desired_access, 0, 0,
 			 OPEN_EXISTING, flags_and_attributes, 0);
 
-	free(escaped_port_name);
+	free(escaped_port_name_wc);
 
 	if (port->hdl == INVALID_HANDLE_VALUE)
 		RETURN_FAIL("Port CreateFile() failed");
@@ -2554,21 +2561,43 @@ SP_API char *sp_last_error_message(void)
 	TRACE_VOID();
 
 #ifdef _WIN32
-	char *message;
+	WCHAR *wc_message = NULL;
+	char *message = NULL;
+	int utf8_length;
 	DWORD error = GetLastError();
 
-	DWORD length = FormatMessageA(
+	/* Fetch the message as UTF-16 and hand it out as UTF-8. */
+	DWORD length = FormatMessageW(
 		FORMAT_MESSAGE_ALLOCATE_BUFFER |
 		FORMAT_MESSAGE_FROM_SYSTEM |
 		FORMAT_MESSAGE_IGNORE_INSERTS,
 		NULL,
 		error,
 		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-		(LPSTR) &message,
+		(LPWSTR) &wc_message,
 		0, NULL );
 
-	if (length >= 2 && message[length - 2] == '\r')
-		message[length - 2] = '\0';
+	if (length) {
+		if (length >= 2 && wc_message[length - 2] == L'\r')
+			wc_message[length - 2] = L'\0';
+
+		/*
+		 * Allocate with LocalAlloc() so that sp_free_error_message()
+		 * can keep releasing the result with LocalFree().
+		 */
+		utf8_length = WideCharToMultiByte(CP_UTF8, 0, wc_message, -1,
+		                                  NULL, 0, NULL, NULL);
+		if (utf8_length && (message = LocalAlloc(LMEM_FIXED, utf8_length))
+		    && !WideCharToMultiByte(CP_UTF8, 0, wc_message, -1,
+		                            message, utf8_length, NULL, NULL)) {
+			LocalFree(message);
+			message = NULL;
+		}
+		LocalFree(wc_message);
+	}
+
+	/* Leave the error code intact for sp_last_error_code(). */
+	SetLastError(error);
 
 	RETURN_STRING(message);
 #else

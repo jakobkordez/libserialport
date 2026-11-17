@@ -280,6 +280,10 @@ SP_PRIV struct sp_port **list_append(struct sp_port **list, const char *portname
 /* OS-specific Helper functions. */
 SP_PRIV enum sp_return get_port_details(struct sp_port *port);
 SP_PRIV enum sp_return list_ports(struct sp_port ***list);
+#ifdef _WIN32
+/* Windows strings crossing the public API are UTF-8; convert for "W" calls. */
+SP_PRIV WCHAR *utf8_to_wc(const char *utf8_str);
+#endif
 
 /* Timing abstraction */
 

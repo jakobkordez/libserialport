@@ -41,8 +41,11 @@ static char *wc_to_utf8(PWCHAR wc_buffer, ULONG wc_bytes)
 	memcpy(wc_str, wc_buffer, wc_bytes);
 	wc_str[wc_length] = 0;
 
-	/* Compute the size of the UTF-8 converted string. */
-	if (!(utf8_bytes = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wc_str, -1,
+	/*
+	 * Compute the size of the UTF-8 converted string. CP_UTF8 only
+	 * accepts flags of 0 or WC_ERR_INVALID_CHARS.
+	 */
+	if (!(utf8_bytes = WideCharToMultiByte(CP_UTF8, 0, wc_str, -1,
 	                                 NULL, 0, NULL, NULL)))
 		goto wc_to_utf8_end;
 
@@ -51,7 +54,7 @@ static char *wc_to_utf8(PWCHAR wc_buffer, ULONG wc_bytes)
 		goto wc_to_utf8_end;
 
 	/* Actually converted to UTF-8. */
-	if (!WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, wc_str, -1,
+	if (!WideCharToMultiByte(CP_UTF8, 0, wc_str, -1,
 	                         utf8_str, utf8_bytes, NULL, NULL)) {
 		free(utf8_str);
 		utf8_str = NULL;
@@ -63,6 +66,32 @@ wc_to_utf8_end:
 		free(wc_str);
 
 	return utf8_str;
+}
+
+/*
+ * Convert a NUL-terminated UTF-8 string to a newly allocated wide string
+ * for use with the Win32 "W" APIs. Returns NULL on invalid UTF-8 or
+ * allocation failure.
+ */
+SP_PRIV WCHAR *utf8_to_wc(const char *utf8_str)
+{
+	int wc_length;
+	WCHAR *wc_str;
+
+	if (!(wc_length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+	                                      utf8_str, -1, NULL, 0)))
+		return NULL;
+
+	if (!(wc_str = malloc(wc_length * sizeof(WCHAR))))
+		return NULL;
+
+	if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+	                         utf8_str, -1, wc_str, wc_length)) {
+		free(wc_str);
+		return NULL;
+	}
+
+	return wc_str;
 }
 
 static char *get_root_hub_name(HANDLE host_controller)
@@ -359,7 +388,7 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 	 * Description limited to 127 char, anything longer
 	 * would not be user friendly anyway.
 	 */
-	char description[128];
+	WCHAR description[128];
 	SP_DEVINFO_DATA device_info_data = { .cbSize = sizeof(device_info_data) };
 	HDEVINFO device_info;
 	int i;
@@ -372,7 +401,8 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 	for (i = 0; SetupDiEnumDeviceInfo(device_info, i, &device_info_data); i++) {
 		HKEY device_key;
 		DEVINST dev_inst;
-		char value[8], class[16];
+		WCHAR value[8];
+		char value_utf8[ARRAYSIZE(value) * 3], class[16];
 		DWORD size, type;
 		CONFIGRET cr;
 
@@ -383,14 +413,18 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 		if (device_key == INVALID_HANDLE_VALUE)
 			continue;
 		size = sizeof(value);
-		if (RegQueryValueExA(device_key, "PortName", NULL, &type, (LPBYTE)value,
+		if (RegQueryValueExW(device_key, L"PortName", NULL, &type, (LPBYTE)value,
 		                     &size) != ERROR_SUCCESS || type != REG_SZ) {
 			RegCloseKey(device_key);
 			continue;
 		}
 		RegCloseKey(device_key);
-		value[sizeof(value) - 1] = 0;
-		if (strcmp(value, port->name))
+		/* Registry strings are not guaranteed to be NUL-terminated. */
+		size /= sizeof(WCHAR);
+		value[size < ARRAYSIZE(value) ? size : ARRAYSIZE(value) - 1] = 0;
+		if (!WideCharToMultiByte(CP_UTF8, 0, value, -1, value_utf8,
+		                         sizeof(value_utf8), NULL, NULL)
+		    || strcmp(value_utf8, port->name))
 			continue;
 
 		/* Check port transport type. */
@@ -407,12 +441,12 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 
 		/* Get port description (friendly name). */
 		dev_inst = device_info_data.DevInst;
-		size = sizeof(description);
-		while ((cr = CM_Get_DevNode_Registry_PropertyA(dev_inst,
+		while ((size = sizeof(description),
+		        cr = CM_Get_DevNode_Registry_PropertyW(dev_inst,
 		          CM_DRP_FRIENDLYNAME, 0, description, &size, 0)) != CR_SUCCESS
 		       && CM_Get_Parent(&dev_inst, dev_inst, 0) == CR_SUCCESS) { }
 		if (cr == CR_SUCCESS)
-			port->description = strdup(description);
+			port->description = wc_to_utf8(description, size);
 
 		/* Get more informations for USB connected ports. */
 		if (port->transport == SP_TRANSPORT_USB) {
@@ -463,15 +497,20 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 
 			/* Wake up the USB device to be able to read string descriptor. */
 			char *escaped_port_name;
+			WCHAR *escaped_port_name_wc;
 			HANDLE handle;
 			if (!(escaped_port_name = malloc(strlen(port->name) + 5)))
 				RETURN_ERROR(SP_ERR_MEM, "Escaped port name malloc failed");
 			sprintf(escaped_port_name, "\\\\.\\%s", port->name);
-			handle = CreateFileA(escaped_port_name, GENERIC_READ, 0, 0,
-			                     OPEN_EXISTING,
-			                     FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OVERLAPPED, 0);
+			escaped_port_name_wc = utf8_to_wc(escaped_port_name);
 			free(escaped_port_name);
-			CloseHandle(handle);
+			if (escaped_port_name_wc) {
+				handle = CreateFileW(escaped_port_name_wc, GENERIC_READ, 0, 0,
+				                     OPEN_EXISTING,
+				                     FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OVERLAPPED, 0);
+				free(escaped_port_name_wc);
+				CloseHandle(handle);
+			}
 
 			/* Retrieve USB device details from the device descriptor. */
 			get_usb_details(port, device_info_data.DevInst);
@@ -487,17 +526,16 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 {
 	HKEY key;
-	TCHAR *value, *data;
-	DWORD max_value_len, max_data_size, max_data_len;
-	DWORD value_len, data_size, data_len;
+	WCHAR *value, *data;
+	DWORD max_value_len, max_data_size;
+	DWORD value_len, data_size;
 	DWORD type, index = 0;
 	LSTATUS result;
 	char *name;
-	int name_len;
 	int ret = SP_OK;
 
 	DEBUG("Opening registry key");
-	if ((result = RegOpenKeyEx(HKEY_LOCAL_MACHINE, _T("HARDWARE\\DEVICEMAP\\SERIALCOMM"),
+	if ((result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\SERIALCOMM",
 			0, KEY_QUERY_VALUE, &key)) != ERROR_SUCCESS) {
 		/* It's possible for this key to not exist if there are no serial ports
 		 * at all. In that case we're done. Return a failure for any other error. */
@@ -508,18 +546,17 @@ SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 		goto out_done;
 	}
 	DEBUG("Querying registry key value and data sizes");
-	if ((result = RegQueryInfoKey(key, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+	if ((result = RegQueryInfoKeyW(key, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
 				&max_value_len, &max_data_size, NULL, NULL)) != ERROR_SUCCESS) {
 		SetLastError(result);
 		SET_FAIL(ret, "RegQueryInfoKey() failed");
 		goto out_close;
 	}
-	max_data_len = max_data_size / sizeof(TCHAR);
-	if (!(value = malloc((max_value_len + 1) * sizeof(TCHAR)))) {
+	if (!(value = malloc((max_value_len + 1) * sizeof(WCHAR)))) {
 		SET_ERROR(ret, SP_ERR_MEM, "Registry value malloc failed");
 		goto out_close;
 	}
-	if (!(data = malloc((max_data_len + 1) * sizeof(TCHAR)))) {
+	if (!(data = malloc(max_data_size + sizeof(WCHAR)))) {
 		SET_ERROR(ret, SP_ERR_MEM, "Registry data malloc failed");
 		goto out_free_value;
 	}
@@ -527,26 +564,15 @@ SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 	while (
 		value_len = max_value_len + 1,
 		data_size = max_data_size,
-		RegEnumValue(key, index, value, &value_len,
+		RegEnumValueW(key, index, value, &value_len,
 			NULL, &type, (LPBYTE)data, &data_size) == ERROR_SUCCESS)
 	{
 		if (type == REG_SZ) {
-			data_len = data_size / sizeof(TCHAR);
-			data[data_len] = '\0';
-#ifdef UNICODE
-			name_len = WideCharToMultiByte(CP_ACP, 0, data, -1, NULL, 0, NULL, NULL);
-#else
-			name_len = data_len + 1;
-#endif
-			if (!(name = malloc(name_len))) {
+			/* wc_to_utf8() NUL-terminates; the registry data may not be. */
+			if (!(name = wc_to_utf8(data, data_size))) {
 				SET_ERROR(ret, SP_ERR_MEM, "Registry port name malloc failed");
 				goto out;
 			}
-#ifdef UNICODE
-			WideCharToMultiByte(CP_ACP, 0, data, -1, name, name_len, NULL, NULL);
-#else
-			strcpy(name, data);
-#endif
 			DEBUG_FMT("Found port %s", name);
 			if (!(*list = list_append(*list, name))) {
 				SET_ERROR(ret, SP_ERR_MEM, "List append failed");
