@@ -393,14 +393,14 @@ static void get_usb_details(struct sp_port *port, DEVINST dev_inst_match)
 /* Size of a port name in the registry, in WCHARs including the NUL. */
 #define MAX_PORT_NAME 8
 
-/* A present device that has a serial port name. */
+/* A device that has a serial port name. */
 struct port_device {
 	/* Port name, as UTF-8. */
 	char name[MAX_PORT_NAME * 3];
 	DEVINST dev_inst;
 };
 
-/* The serial port devices found by one walk over the present devices. */
+/* The serial port devices found by one walk over the devices. */
 struct port_index {
 	HDEVINFO device_info;
 	struct port_device *devices;
@@ -414,14 +414,17 @@ static void free_port_index(struct port_index *index)
 }
 
 /*
- * Walk the present devices, collecting those that have a serial port name.
+ * Walk the devices, collecting those that have a serial port name.
  *
  * The walk is the expensive part of looking up a port's details, so
  * list_ports() does it once and shares the result between all its ports.
  * If only_name is given, the walk stops at the first device of that name.
+ * If present_only is false, devices that are no longer present are
+ * included.
  */
 static enum sp_return build_port_index(struct port_index *index,
-                                       const char *only_name)
+                                       const char *only_name,
+                                       bool present_only)
 {
 	SP_DEVINFO_DATA device_info_data = { .cbSize = sizeof(device_info_data) };
 	size_t capacity = 0;
@@ -429,8 +432,8 @@ static enum sp_return build_port_index(struct port_index *index,
 
 	index->devices = NULL;
 	index->count = 0;
-	index->device_info = SetupDiGetClassDevs(NULL, 0, 0,
-	                                         DIGCF_PRESENT | DIGCF_ALLCLASSES);
+	index->device_info = SetupDiGetClassDevs(NULL, 0, 0, DIGCF_ALLCLASSES |
+	                                         (present_only ? DIGCF_PRESENT : 0));
 	if (index->device_info == INVALID_HANDLE_VALUE)
 		RETURN_FAIL("SetupDiGetClassDevs() failed");
 
@@ -482,10 +485,23 @@ static enum sp_return build_port_index(struct port_index *index,
 	RETURN_OK();
 }
 
+/* Find the first device in the index with the given port name. */
+static const struct port_device *find_port_device(const struct port_index *index,
+                                                  const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < index->count; i++)
+		if (!strcmp(index->devices[i].name, name))
+			return &index->devices[i];
+
+	return NULL;
+}
+
 /* Fill in the details of a port from the device of its name in the index. */
 static enum sp_return get_indexed_port_details(struct sp_port *port, void *context)
 {
-	const struct port_index *index = context;
+	const struct port_device *device = find_port_device(context, port->name);
 	/*
 	 * Description limited to 127 char, anything longer
 	 * would not be user friendly anyway.
@@ -495,15 +511,11 @@ static enum sp_return get_indexed_port_details(struct sp_port *port, void *conte
 	char class[16];
 	DWORD size;
 	CONFIGRET cr;
-	size_t i;
 
 	/* As the walk did before, take the first device of this name. */
-	for (i = 0; i < index->count; i++)
-		if (!strcmp(index->devices[i].name, port->name))
-			break;
-	if (i == index->count)
+	if (!device)
 		RETURN_OK();
-	port_dev_inst = index->devices[i].dev_inst;
+	port_dev_inst = device->dev_inst;
 
 	/* Check port transport type. */
 	dev_inst = port_dev_inst;
@@ -602,7 +614,7 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 	struct port_index index;
 	enum sp_return ret;
 
-	TRY(build_port_index(&index, port->name));
+	TRY(build_port_index(&index, port->name, true));
 	ret = get_indexed_port_details(port, &index);
 	free_port_index(&index);
 
@@ -618,7 +630,9 @@ SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 	DWORD type, index = 0;
 	LSTATUS result;
 	char *name;
-	struct port_index devices;
+	struct port_index devices, all_devices;
+	/* Whether all_devices has been built: 0 not yet, 1 yes, -1 failed. */
+	int all_devices_state = 0;
 	int ret = SP_OK;
 
 	DEBUG("Opening registry key");
@@ -649,7 +663,7 @@ SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 	}
 	/* One walk over the devices serves every port in the list. */
 	DEBUG("Indexing serial port devices");
-	if ((ret = build_port_index(&devices, NULL)) != SP_OK)
+	if ((ret = build_port_index(&devices, NULL, true)) != SP_OK)
 		goto out;
 	DEBUG("Iterating over values");
 	while (
@@ -665,6 +679,27 @@ SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 				goto out_free_index;
 			}
 			DEBUG_FMT("Found port %s", name);
+			/*
+			 * A driver removes its port from SERIALCOMM only once the
+			 * last handle to it is closed, so a USB adapter unplugged
+			 * while the port is open stays listed there although its
+			 * device is gone. Leave such a port out. Only a port whose
+			 * device is known but no longer present is left out: a port
+			 * with no device at all, as some drivers register, is kept.
+			 */
+			if (!find_port_device(&devices, name)) {
+				if (all_devices_state == 0)
+					all_devices_state = build_port_index(&all_devices,
+						NULL, false) == SP_OK ? 1 : -1;
+				if (all_devices_state == 1 &&
+				    find_port_device(&all_devices, name)) {
+					DEBUG_FMT("Skipping port %s, its device is no longer present",
+					          name);
+					free(name);
+					index++;
+					continue;
+				}
+			}
 			if (!(*list = list_append_using(*list, name,
 					get_indexed_port_details, &devices))) {
 				SET_ERROR(ret, SP_ERR_MEM, "List append failed");
@@ -676,6 +711,8 @@ SP_PRIV enum sp_return list_ports(struct sp_port ***list)
 		index++;
 	}
 out_free_index:
+	if (all_devices_state == 1)
+		free_port_index(&all_devices);
 	free_port_index(&devices);
 out:
 	free(data);
