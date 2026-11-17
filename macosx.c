@@ -35,6 +35,7 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 	io_iterator_t iter;
 	io_object_t ioport, ioparent;
 	CFTypeRef cf_property, cf_bus, cf_address, cf_vendor, cf_product;
+	long long location;
 	Boolean result;
 	char path[PATH_MAX], class[64];
 
@@ -118,6 +119,31 @@ SP_PRIV enum sp_return get_port_details(struct sp_port *port)
 		                                         kCFAllocatorDefault,
 		                                         kIORegistryIterateRecursively
 		                                         | kIORegistryIterateParents);
+		if (!cf_address)
+			cf_address = IORegistryEntrySearchCFProperty(ioport, kIOServicePlane,
+			                                         CFSTR("kUSBAddress"),
+			                                         kCFAllocatorDefault,
+			                                         kIORegistryIterateRecursively
+			                                         | kIORegistryIterateParents);
+		/*
+		 * The IOUSBHost stack, which is all that current macOS has, does
+		 * not publish USBBusNumber. Take the bus number from the top byte
+		 * of the device's location ID instead, as libusb does.
+		 */
+		if (!cf_bus &&
+		    (cf_property = IORegistryEntrySearchCFProperty(ioport, kIOServicePlane,
+		                                         CFSTR("locationID"),
+		                                         kCFAllocatorDefault,
+		                                         kIORegistryIterateRecursively
+		                                         | kIORegistryIterateParents))) {
+			if (CFGetTypeID(cf_property) == CFNumberGetTypeID() &&
+			    CFNumberGetValue(cf_property, kCFNumberLongLongType, &location)) {
+				bus = (int)((location >> 24) & 0xff);
+				cf_bus = CFNumberCreate(kCFAllocatorDefault,
+				                        kCFNumberIntType, &bus);
+			}
+			CFRelease(cf_property);
+		}
 		if (cf_bus && cf_address &&
 		    CFNumberGetValue(cf_bus    , kCFNumberIntType, &bus) &&
 		    CFNumberGetValue(cf_address, kCFNumberIntType, &address)) {
