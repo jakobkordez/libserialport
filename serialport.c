@@ -1402,6 +1402,24 @@ SP_API enum sp_return sp_blocking_read_next(struct sp_port *port, void *buf,
 #endif
 }
 
+#ifndef _WIN32
+/** Tell whether a port can be read from right now, without waiting. */
+static bool readable_now(struct sp_port *port)
+{
+	struct timeval no_wait = { 0, 0 };
+	fd_set fds;
+
+	/* An fd_set only has room for descriptors below FD_SETSIZE. */
+	if (port->fd >= FD_SETSIZE)
+		return false;
+
+	FD_ZERO(&fds);
+	FD_SET(port->fd, &fds);
+
+	return select(port->fd + 1, &fds, NULL, NULL, &no_wait) > 0;
+}
+#endif
+
 SP_API enum sp_return sp_nonblocking_read(struct sp_port *port, void *buf,
                                           size_t count)
 {
@@ -1447,7 +1465,24 @@ SP_API enum sp_return sp_nonblocking_read(struct sp_port *port, void *buf,
 	ssize_t bytes_read;
 
 	/* Returns the number of bytes read, or -1 upon failure. */
-	if ((bytes_read = read(port->fd, buf, count)) < 0) {
+	bytes_read = read(port->fd, buf, count);
+
+	if (bytes_read == 0 && count > 0 && readable_now(port)) {
+		/*
+		 * A port gives 0 both when it has no data and when it has
+		 * been hung up, e.g. because the device was unplugged. Only
+		 * the second leaves it readable. Read again, in case data
+		 * arrived in between: if there is still nothing, it is gone.
+		 */
+		bytes_read = read(port->fd, buf, count);
+		if (bytes_read == 0) {
+			/* read() does not set errno for end-of-file. */
+			errno = EIO;
+			RETURN_FAIL("read() returned end-of-file, port disconnected");
+		}
+	}
+
+	if (bytes_read < 0) {
 		if (errno == EAGAIN)
 			/* No bytes available. */
 			bytes_read = 0;
