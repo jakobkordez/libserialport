@@ -321,14 +321,27 @@ SP_PRIV struct sp_port **list_append(struct sp_port **list,
 {
 	void *tmp;
 	size_t count;
+	enum sp_return ret;
 
 	for (count = 0; list[count]; count++)
 		;
 	if (!(tmp = realloc(list, sizeof(struct sp_port *) * (count + 2))))
 		goto fail;
 	list = tmp;
-	if (sp_get_port_by_name(portname, &list[count]) != SP_OK)
+	ret = sp_get_port_by_name(portname, &list[count]);
+	if (ret == SP_ERR_MEM)
 		goto fail;
+	if (ret != SP_OK) {
+		/*
+		 * The port exists but its details could not be retrieved, e.g.
+		 * because access to the device node is denied (as SELinux does
+		 * for some ports on Android). Leave it out of the list rather
+		 * than failing the whole enumeration.
+		 */
+		DEBUG_FMT("Could not get details for port %s, skipping", portname);
+		list[count] = NULL;
+		return list;
+	}
 	list[count + 1] = NULL;
 	return list;
 
