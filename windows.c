@@ -288,15 +288,22 @@ static void enumerate_hub(struct sp_port *port, const char *hub_name,
 	HANDLE hub_device;
 	ULONG size = sizeof(hub_info);
 	char *device_name;
+	WCHAR *device_name_wc;
 
 	/* Open the hub with its full name. */
 	if (!(device_name = malloc(strlen("\\\\.\\") + strlen(hub_name) + 1)))
 		return;
 	strcpy(device_name, "\\\\.\\");
 	strcat(device_name, hub_name);
-	hub_device = CreateFileA(device_name, GENERIC_WRITE, FILE_SHARE_WRITE,
-	                         NULL, OPEN_EXISTING, 0, NULL);
+
+	/* Hub names come from wc_to_utf8(); open through the wide API. */
+	device_name_wc = utf8_to_wc(device_name);
 	free(device_name);
+	if (!device_name_wc)
+		return;
+	hub_device = CreateFileW(device_name_wc, GENERIC_WRITE, FILE_SHARE_WRITE,
+	                         NULL, OPEN_EXISTING, 0, NULL);
+	free(device_name_wc);
 	if (hub_device == INVALID_HANDLE_VALUE)
 		return;
 
