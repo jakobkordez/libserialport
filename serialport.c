@@ -485,6 +485,22 @@ static enum sp_return restart_wait(struct sp_port *port)
 }
 #endif
 
+#if !defined(_WIN32) && (defined(HAVE_FLOCK) || defined(TIOCEXCL))
+/**
+ * Give up on a port that could not be claimed during sp_open().
+ *
+ * Leaves errno as it was, so the caller still reports why the open failed.
+ */
+static void abandon_open(struct sp_port *port)
+{
+	int saved_errno = errno;
+
+	close(port->fd);
+	port->fd = -1;
+	errno = saved_errno;
+}
+#endif
+
 SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 {
 	struct port_data data;
@@ -606,8 +622,10 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 	 * descriptor is already locked by another process.
 	 */
 #ifdef HAVE_FLOCK
-	if (flock(port->fd, LOCK_EX | LOCK_NB) < 0)
+	if (flock(port->fd, LOCK_EX | LOCK_NB) < 0) {
+		abandon_open(port);
 		RETURN_FAIL("flock() failed");
+	}
 #endif
 
 #ifdef TIOCEXCL
@@ -616,8 +634,10 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 	 * lead to EINVAL or ENOTTY.
 	 * These errors aren't fatal and can be ignored.
 	 */
-	if (ioctl(port->fd, TIOCEXCL) < 0 && errno != EINVAL && errno != ENOTTY)
+	if (ioctl(port->fd, TIOCEXCL) < 0 && errno != EINVAL && errno != ENOTTY) {
+		abandon_open(port);
 		RETURN_FAIL("ioctl() failed");
+	}
 #endif
 
 #endif
