@@ -1183,6 +1183,25 @@ SP_API enum sp_return sp_blocking_read(struct sp_port *port, void *buf,
 				RETURN_FAIL("read() failed");
 		}
 
+		if (result == 0) {
+			/*
+			 * select() reported the port as readable, yet there was
+			 * nothing to read. That is end-of-file, which a serial
+			 * port only delivers once it has been hung up, e.g.
+			 * because the device was unplugged. It stays readable
+			 * from then on, so retrying would spin until the timeout
+			 * (or forever without one) and never report the loss.
+			 */
+			if (bytes_read > 0) {
+				/* Hand over what did arrive; the next call fails. */
+				DEBUG("Port disconnected, returning bytes read so far");
+				RETURN_INT(bytes_read);
+			}
+			/* read() does not set errno for end-of-file. */
+			errno = EIO;
+			RETURN_FAIL("read() returned end-of-file, port disconnected");
+		}
+
 		bytes_read += result;
 		ptr += result;
 	}
@@ -1301,6 +1320,16 @@ SP_API enum sp_return sp_blocking_read_next(struct sp_port *port, void *buf,
 			else
 				/* This is an actual failure. */
 				RETURN_FAIL("read() failed");
+		}
+
+		if (result == 0) {
+			/*
+			 * Readable but nothing to read: the port has been hung
+			 * up, see sp_blocking_read(). read() does not set errno
+			 * for end-of-file.
+			 */
+			errno = EIO;
+			RETURN_FAIL("read() returned end-of-file, port disconnected");
 		}
 
 		bytes_read = result;
