@@ -167,8 +167,20 @@ SP_PRIV struct timeval *timeout_timeval(struct timeout *timeout)
 
 SP_PRIV unsigned int timeout_remaining_ms(struct timeout *timeout)
 {
+	unsigned int remaining_ms;
+
 	if (timeout->limit_ms && timeout->overflow)
 		return timeout->limit_ms;
-	else
-		return time_as_ms(&timeout->delta);
+
+	remaining_ms = time_as_ms(&timeout->delta);
+
+	/*
+	 * Callers hand this to the OS, where zero means "no timeout". Only
+	 * return zero if there really is none: with under a millisecond left
+	 * to run, round up instead of turning the wait into an endless one.
+	 */
+	if (timeout->ms && !remaining_ms)
+		remaining_ms = 1;
+
+	return remaining_ms;
 }
